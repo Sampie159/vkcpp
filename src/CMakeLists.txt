@@ -26,9 +26,3 @@ elseif (UNIX)
         OS_UNIX=1
     )
 endif ()
-
-target_include_directories(
-    playground
-    PRIVATE
-    ../include
-)
