@@ -8,6 +8,8 @@ static const char* TITLE = "Hello Window (Debug)";
 static const char* TITLE = "Hello Window";
 #endif
 
+static constexpr u32 MAX_FRAMES_IN_FLIGHT = 2;
+
 #if DEBUG
 static constexpr const char* validation_layers[] = {
 	"VK_LAYER_KHRONOS_validation",
@@ -17,7 +19,6 @@ static constexpr u32 validation_layers_count = sizeof(validation_layers) / sizeo
 
 static constexpr const char* device_extensions[] = {
 	VK_KHR_SWAPCHAIN_EXTENSION_NAME,
-	VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME,
 };
 static constexpr u32 device_extensions_count = sizeof(device_extensions) / sizeof(const char*);
 
@@ -51,7 +52,7 @@ struct App {
 	void create_image_views();
 	void create_graphics_pipeline();
 	void create_command_pool();
-	void create_command_buffer();
+	void create_command_buffers();
 	void create_sync_objects();
 
 	void run();
@@ -61,7 +62,7 @@ struct App {
 	void draw_frame();
 
 	GLFWwindow* window;
-	VkInstance  instance;
+	VkInstance instance;
 	VkPhysicalDeviceSurfaceInfo2KHR surface;
 	VkPhysicalDevice physical_device = VK_NULL_HANDLE;
 	VkDevice device;
@@ -76,13 +77,15 @@ struct App {
 	VkPipelineLayout pipeline_layout;
 	VkPipeline graphics_pipeline;
 	VkCommandPool command_pool;
-	VkCommandBuffer command_buffer;
-	VkSemaphore img_available_sem;
-	VkSemaphore render_finished_sem;
-	VkFence in_flight_fence;
+	VkCommandBuffer command_buffers[MAX_FRAMES_IN_FLIGHT];
+	VkSemaphore img_available_sem[MAX_FRAMES_IN_FLIGHT];
+	VkSemaphore* render_finished_sems;
+	VkFence in_flight_fence[MAX_FRAMES_IN_FLIGHT];
+	VkImageLayout* swapchain_layouts;
 
 	QueueFamilyIndices indices;
 	SwapchainSupportDetails swapchain_support;
+	u32 current_frame = 0;
 
 #if DEBUG
 	bool check_validation_layer_support();
@@ -114,19 +117,21 @@ App::App() {
 	create_image_views();
 	create_graphics_pipeline();
 	create_command_pool();
-	create_command_buffer();
+	create_command_buffers();
 	create_sync_objects();
 }
 
 App::~App() {
-	vkDestroySemaphore(device, img_available_sem, NULL);
-	vkDestroySemaphore(device, render_finished_sem, NULL);
-	vkDestroyFence(device, in_flight_fence, NULL);
+	for (u32 i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+		vkDestroySemaphore(device, img_available_sem[i], NULL);
+		vkDestroyFence(device, in_flight_fence[i], NULL);
+	}
 	vkDestroyCommandPool(device, command_pool, NULL);
 	vkDestroyPipeline(device, graphics_pipeline, NULL);
 	vkDestroyPipelineLayout(device, pipeline_layout, NULL);
 	
 	for (u32 i = 0; i < image_count; i++) {
+		vkDestroySemaphore(device, render_finished_sems[i], NULL);
 		vkDestroyImageView(device, swapchain_image_views[i], NULL);
 	}
 	
@@ -605,6 +610,10 @@ void App::create_swapchain() {
 
 	swapchain_format = surface_format.surfaceFormat.format;
 	swapchain_extent = extent;
+	swapchain_layouts = (VkImageLayout*)malloc(sizeof(VkImageLayout) * image_count);
+	for (u32 i = 0; i < image_count; i++) {
+		swapchain_layouts[i] = VK_IMAGE_LAYOUT_UNDEFINED;
+	}
 }
 
 void App::create_image_views() {
@@ -667,6 +676,8 @@ void App::create_graphics_pipeline() {
 		VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT,
 		VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT,
 		VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY,
+		VK_DYNAMIC_STATE_CULL_MODE,
+		VK_DYNAMIC_STATE_FRONT_FACE,
 	};
 
 	VkPipelineDynamicStateCreateInfo dynamic_state{};
@@ -788,14 +799,14 @@ void App::create_command_pool() {
 	}
 }
 
-void App::create_command_buffer() {
+void App::create_command_buffers() {
 	VkCommandBufferAllocateInfo alloc_info{};
 	alloc_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
 	alloc_info.commandPool = command_pool;
 	alloc_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-	alloc_info.commandBufferCount = 1;
+	alloc_info.commandBufferCount = MAX_FRAMES_IN_FLIGHT;
 
-	if (vkAllocateCommandBuffers(device, &alloc_info, &command_buffer) != VK_SUCCESS) {
+	if (vkAllocateCommandBuffers(device, &alloc_info, command_buffers) != VK_SUCCESS) {
 		Panic("Failed to allocate command buffers!");
 	}
 }
@@ -840,7 +851,7 @@ void App::record_command_buffer(VkCommandBuffer buffer, u32 image_index) {
 	barrier.srcAccessMask = VK_ACCESS_2_NONE;
 	barrier.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
 	barrier.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-	barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	barrier.oldLayout = swapchain_layouts[image_index];
 	barrier.newLayout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL;
 	barrier.image = swapchain_images[image_index];
 	barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -848,6 +859,7 @@ void App::record_command_buffer(VkCommandBuffer buffer, u32 image_index) {
 	barrier.subresourceRange.levelCount = 1;
 	barrier.subresourceRange.baseArrayLayer = 0;
 	barrier.subresourceRange.layerCount = 1;
+	swapchain_layouts[image_index] = barrier.newLayout;
 
 	VkDependencyInfo dep_info{};
 	dep_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
@@ -856,19 +868,22 @@ void App::record_command_buffer(VkCommandBuffer buffer, u32 image_index) {
 
 	vkCmdPipelineBarrier2(buffer, &dep_info);
 	vkCmdBeginRendering(buffer, &render_info);
-	vkCmdBindPipeline(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphics_pipeline);
 	vkCmdSetViewportWithCount(buffer, 1, &viewport);
 	vkCmdSetScissorWithCount(buffer, 1, &scissor);
 	vkCmdSetPrimitiveTopology(buffer, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
+	vkCmdSetCullMode(buffer, VK_CULL_MODE_BACK_BIT);
+	vkCmdSetFrontFace(buffer, VK_FRONT_FACE_CLOCKWISE);
+	vkCmdBindPipeline(buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphics_pipeline);
 	vkCmdDraw(buffer, 3, 1, 0, 0);
 	vkCmdEndRendering(buffer);
 
 	barrier.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
 	barrier.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-	barrier.dstStageMask = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
+	barrier.dstStageMask = VK_PIPELINE_STAGE_2_NONE;
 	barrier.dstAccessMask = VK_ACCESS_2_NONE;
 	barrier.oldLayout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL;
 	barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+	swapchain_layouts[image_index] = barrier.newLayout;
 
 	vkCmdPipelineBarrier2(buffer, &dep_info);
 
@@ -878,28 +893,37 @@ void App::record_command_buffer(VkCommandBuffer buffer, u32 image_index) {
 }
 
 void App::draw_frame() {
-	vkWaitForFences(device, 1, &in_flight_fence, VK_TRUE, UINT64_MAX);
-	vkResetFences(device, 1, &in_flight_fence);
+	vkWaitForFences(device, 1, &in_flight_fence[current_frame], VK_TRUE, UINT64_MAX);
+	vkResetFences(device, 1, &in_flight_fence[current_frame]);
+
+	VkAcquireNextImageInfoKHR acquire_info{};
+	acquire_info.sType = VK_STRUCTURE_TYPE_ACQUIRE_NEXT_IMAGE_INFO_KHR;
+	acquire_info.swapchain = swapchain;
+	acquire_info.timeout = UINT64_MAX;
+	acquire_info.semaphore = img_available_sem[current_frame];
+	acquire_info.fence = VK_NULL_HANDLE;
+	acquire_info.deviceMask = 1;
 
 	u32 image_index;
-	vkAcquireNextImageKHR(device, swapchain, UINT64_MAX, img_available_sem, VK_NULL_HANDLE, &image_index);
+	vkAcquireNextImage2KHR(device, &acquire_info, &image_index);
 
-	vkResetCommandBuffer(command_buffer, 0);
-	record_command_buffer(command_buffer, image_index);
+	vkResetCommandBuffer(command_buffers[current_frame], 0);
+	record_command_buffer(command_buffers[current_frame], image_index);
 
 	VkSemaphoreSubmitInfo wait_info{};
 	wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
-	wait_info.semaphore = img_available_sem;
+	wait_info.semaphore = img_available_sem[current_frame];
 	wait_info.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
 
 	VkSemaphoreSubmitInfo signal_info{};
 	signal_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
-	signal_info.semaphore = render_finished_sem;
+	signal_info.semaphore = render_finished_sems[image_index];
 	signal_info.stageMask = VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT;
 
 	VkCommandBufferSubmitInfo cmd_info{};
 	cmd_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
-	cmd_info.commandBuffer = command_buffer;
+	cmd_info.commandBuffer = command_buffers[current_frame];
+	cmd_info.deviceMask = 1;
 
 	VkSubmitInfo2 submit_info{};
 	submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
@@ -910,19 +934,20 @@ void App::draw_frame() {
 	submit_info.signalSemaphoreInfoCount = 1;
 	submit_info.pSignalSemaphoreInfos = &signal_info;
 
-	if (vkQueueSubmit2(graphics_queue, 1, &submit_info, in_flight_fence) != VK_SUCCESS) {
+	if (vkQueueSubmit2(graphics_queue, 1, &submit_info, in_flight_fence[current_frame]) != VK_SUCCESS) {
 		Panic("Failed to submit queue!");
 	}
 
 	VkPresentInfoKHR present_info{};
 	present_info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
 	present_info.waitSemaphoreCount = 1;
-	present_info.pWaitSemaphores = &render_finished_sem;
+	present_info.pWaitSemaphores = &render_finished_sems[image_index];
 	present_info.swapchainCount = 1;
 	present_info.pSwapchains = &swapchain;
 	present_info.pImageIndices = &image_index;
 
 	vkQueuePresentKHR(present_queue, &present_info);
+	current_frame = (current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
 }
 
 void App::create_sync_objects() {
@@ -933,9 +958,17 @@ void App::create_sync_objects() {
 	fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
 	fence_info.flags = VK_FENCE_CREATE_SIGNALED_BIT;
 
-	if (vkCreateSemaphore(device, &sem_info, NULL, &img_available_sem) != VK_SUCCESS ||
-		vkCreateSemaphore(device, &sem_info, NULL, &render_finished_sem) != VK_SUCCESS ||
-		vkCreateFence(device, &fence_info, NULL, &in_flight_fence) != VK_SUCCESS) {
-		Panic("Failed to create synchronization objects!");
+	for (u32 i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+		if (vkCreateSemaphore(device, &sem_info, NULL, &img_available_sem[i]) != VK_SUCCESS ||
+			vkCreateFence(device, &fence_info, NULL, &in_flight_fence[i]) != VK_SUCCESS) {
+			Panic("Failed to create synchronization objects!");
+		}
+	}
+
+	render_finished_sems = (VkSemaphore*)malloc(sizeof(VkSemaphore) * image_count);
+	for (u32 i = 0; i < image_count; i++) {
+		if (vkCreateSemaphore(device, &sem_info, NULL, &render_finished_sems[i]) != VK_SUCCESS) {
+			Panic("Failed to create synchronization objects!");
+		}
 	}
 }
