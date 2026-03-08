@@ -8,7 +8,7 @@ static const char* TITLE = "Window! (Debug)";
 static const char* TITLE = "Window!";
 #endif
 
-static constexpr u32 INVALID_QUEUE = 0xFFFFFFFF;
+static constexpr u32 INVALID_QUEUE = UINT32_MAX;
 static constexpr u32 MAX_FRAMES_IN_FLIGHT = 2;
 
 struct App {
@@ -23,8 +23,12 @@ struct App {
 	void create_swapchain();
 	void create_sync_objects();
 	void create_command_buffers();
+	void create_graphics_pipeline();
 
 	void run();
+	VkShaderModule create_shader_module(const char* path);
+	void record_draw_buffer(VkCommandBuffer cmd, u32 image_index);
+	void draw_frame();
 
 	GLFWwindow* window;
 	VkInstance instance;
@@ -47,10 +51,10 @@ struct App {
 	} swapchain;
 
 	struct {
-		VkQueue graphics = VK_NULL_HANDLE;
-		VkQueue present = VK_NULL_HANDLE;
-		VkQueue compute = VK_NULL_HANDLE;
-		VkQueue transfer = VK_NULL_HANDLE;
+		VkQueue graphics;
+		VkQueue present;
+		VkQueue compute;
+		VkQueue transfer;
 	} queues;
 
 	struct {
@@ -73,11 +77,23 @@ struct App {
 		VkFence in_flight;
 	} frames[MAX_FRAMES_IN_FLIGHT];
 
+	struct {
+		VkPipelineLayout graphics_layout;
+		VkPipeline graphics;
+	} pipeline;
+
 	Arena arena{GB(1)};
+	u32 current_frame = 0;
 };
 
 static void error_callback(s32 code, const char* desc) {
 	Panic("GLFW ERROR (%d): %s", code, desc);
+}
+
+static void key_callback(GLFWwindow* window, s32 key, s32 scancode, s32 action, s32 mods) {
+	if (action == GLFW_PRESS) {
+		if (key == GLFW_KEY_Q || key == GLFW_KEY_ESCAPE) glfwSetWindowShouldClose(window, GLFW_TRUE);
+	}
 }
 
 #if DEBUG
@@ -115,6 +131,7 @@ App::App() {
 	create_swapchain();
 	create_sync_objects();
 	create_command_buffers();
+	create_graphics_pipeline();
 }
 
 void App::init_glfw() {
@@ -131,6 +148,7 @@ void App::init_glfw() {
 		glfwTerminate();
 		Panic("Failed to create window!");
 	}
+	glfwSetKeyCallback(window, key_callback);
 }
 
 void App::create_instance() {
@@ -308,7 +326,7 @@ void App::create_device() {
 		families.transfer,
 	};
 
-	f32 queue_priority = 1;
+	f32 queue_priority = 1.0f;
 
 	VkDeviceQueueCreateInfo queue_infos[4];
 	u32 queue_info_count = 0;
@@ -335,8 +353,14 @@ void App::create_device() {
 		};
 	}
 
+	VkPhysicalDeviceVulkan11Features v11{
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+		.shaderDrawParameters = VK_TRUE,
+	};
+
 	VkPhysicalDeviceVulkan13Features v13{
 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+		.pNext = &v11,
 		.synchronization2 = VK_TRUE,
 		.dynamicRendering = VK_TRUE,
 	};
@@ -351,6 +375,7 @@ void App::create_device() {
 
 	const char* extensions[] = {
 		VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+		VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME,
 	};
 
 	VkDeviceCreateInfo create_info{
@@ -501,6 +526,7 @@ void App::create_command_buffers() {
 	for (u32 i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
 		VkCommandPoolCreateInfo pool_info{
 			.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+			.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
 		};
 		
 		pool_info.queueFamilyIndex = families.graphics;
@@ -553,7 +579,126 @@ void App::create_command_buffers() {
 	}
 }
 
+void App::create_graphics_pipeline() {
+	VkPipelineLayoutCreateInfo graphics_layout = {
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+	};
+
+	if (vkCreatePipelineLayout(device, &graphics_layout, NULL, &pipeline.graphics_layout) != VK_SUCCESS) {
+		Panic("Failed to create graphics pipeline layout!");
+	}
+
+	VkShaderModule tri_module = create_shader_module("shaders/tri.spv");
+
+	VkPipelineShaderStageCreateInfo vsci{
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+		.stage = VK_SHADER_STAGE_VERTEX_BIT,
+		.module = tri_module,
+		.pName = "vert_main",
+	};
+
+	VkPipelineShaderStageCreateInfo fsci{
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+		.stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+		.module = tri_module,
+		.pName = "frag_main",
+	};
+
+	VkPipelineShaderStageCreateInfo stages[] = { vsci, fsci };
+
+	VkPipelineVertexInputStateCreateInfo vertex_input{
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+	};
+
+	VkPipelineInputAssemblyStateCreateInfo input_assembly {
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+		.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+		.primitiveRestartEnable = VK_FALSE,
+	};
+
+	VkPipelineTessellationStateCreateInfo tessellation{
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO,
+	};
+
+	VkPipelineRasterizationStateCreateInfo raster{
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+		.depthClampEnable = VK_FALSE,
+		.rasterizerDiscardEnable = VK_FALSE,
+		.polygonMode = VK_POLYGON_MODE_FILL,
+		.cullMode = VK_CULL_MODE_BACK_BIT,
+		.frontFace = VK_FRONT_FACE_CLOCKWISE,
+		.depthBiasEnable = VK_FALSE,
+		.lineWidth = 1.0f,
+	};
+
+	VkPipelineMultisampleStateCreateInfo multisample{
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+		.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+	};
+
+	VkPipelineDepthStencilStateCreateInfo depth_stencil{
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+		.depthTestEnable = VK_FALSE,
+	};
+
+	VkPipelineColorBlendAttachmentState color_attachment{
+		.blendEnable = VK_FALSE,
+		.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
+		                | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+	};
+
+	VkPipelineColorBlendStateCreateInfo color_blend{
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+		.logicOpEnable = VK_FALSE,
+		.attachmentCount = 1,
+		.pAttachments = &color_attachment,
+	};
+
+	VkDynamicState dynamic_states[] = {
+		VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT,
+		VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT,
+	};
+
+	VkPipelineDynamicStateCreateInfo dynamic_state{
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+		.dynamicStateCount = sizeof(dynamic_states) / sizeof(VkDynamicState),
+		.pDynamicStates = dynamic_states,
+	};
+
+	VkPipelineRenderingCreateInfo rendering{
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+		.colorAttachmentCount = 1,
+		.pColorAttachmentFormats = &swapchain.format,
+	};
+
+	VkGraphicsPipelineCreateInfo create_info{
+		.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+		.pNext = &rendering,
+		.stageCount = 2,
+		.pStages = stages,
+		.pVertexInputState = &vertex_input,
+		.pInputAssemblyState = &input_assembly,
+		.pTessellationState = &tessellation,
+		.pRasterizationState = &raster,
+		.pMultisampleState = &multisample,
+		.pDepthStencilState = &depth_stencil,
+		.pColorBlendState = &color_blend,
+		.pDynamicState = &dynamic_state,
+		.layout = pipeline.graphics_layout,
+	};
+
+	if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &create_info, NULL, &pipeline.graphics) != VK_SUCCESS) {
+		Panic("Failed to create graphics pipeline!");
+	}
+
+	vkDestroyShaderModule(device, tri_module, NULL);
+}
+
 App::~App() {
+	vkDeviceWaitIdle(device);
+	vkDestroyPipeline(device, pipeline.graphics, NULL);
+	vkDestroyPipelineLayout(device, pipeline.graphics_layout, NULL);
+
 	for (u32 i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
 		vkDestroySemaphore(device, frames[i].img_available, NULL);
 		vkDestroyFence(device, frames[i].in_flight, NULL);
@@ -564,7 +709,6 @@ App::~App() {
 
 	for (u32 i = 0; i < swapchain.image_count; i++) {
 		vkDestroySemaphore(device, swapchain.render_finished[i], NULL);
-		vkDestroyFence(device, swapchain.in_flight[i], NULL);
 		vkDestroyImageView(device, swapchain.image_views[i], NULL);
 	}
 
@@ -583,8 +727,172 @@ App::~App() {
 void App::run() {
 	arena.reset();
 
-	while (false && !glfwWindowShouldClose(window)) {
+	while (!glfwWindowShouldClose(window)) {
+		Log("Loop!");
 		glfwPollEvents();
+		draw_frame();
 		arena.reset();
 	}
+}
+
+VkShaderModule App::create_shader_module(const char* path) {
+	auto code = read_file(path);
+
+	VkShaderModuleCreateInfo create_info{
+		.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+		.codeSize = code.size(),
+		.pCode = reinterpret_cast<const u32*>(code.data()),
+	};
+
+	VkShaderModule res;
+	if (vkCreateShaderModule(device, &create_info, NULL, &res) != VK_SUCCESS) {
+		Panic("Failed to create shader module %s!", path);
+	}
+
+	return res;
+}
+
+void App::record_draw_buffer(VkCommandBuffer cmd, u32 image_index) {
+	VkCommandBufferBeginInfo begin_info{
+		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+		.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+	};
+
+	vkBeginCommandBuffer(cmd, &begin_info);
+
+	VkImageMemoryBarrier2 barrier{
+		.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+		.srcStageMask = VK_PIPELINE_STAGE_2_NONE,
+		.srcAccessMask = 0,
+		.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+		.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+		.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+		.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		.image = swapchain.images[image_index],
+		.subresourceRange = {
+			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+			.baseMipLevel = 0,
+			.levelCount = 1,
+			.baseArrayLayer = 0,
+			.layerCount = 1,
+		},
+	};
+
+	VkDependencyInfo dep{
+		.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+		.imageMemoryBarrierCount = 1,
+		.pImageMemoryBarriers = &barrier,
+	};
+	vkCmdPipelineBarrier2(cmd, &dep);
+
+	VkRenderingAttachmentInfo attach_info{
+		.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+		.imageView = swapchain.image_views[image_index],
+		.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+		.storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+		.clearValue = { .color = { .float32 = { 0.0, 0.0, 0.0, 1.0 } } },
+	};
+
+	VkRenderingInfo render_info{
+		.sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+		.renderArea = {{0, 0}, swapchain.extent},
+		.layerCount = 1,
+		.colorAttachmentCount = 1,
+		.pColorAttachments = &attach_info,
+	};
+
+	vkCmdBeginRendering(cmd, &render_info);
+
+	VkViewport viewport{
+		0, 0,
+		(f32)swapchain.extent.width,
+		(f32)swapchain.extent.height,
+		0, 1,
+	};
+	vkCmdSetViewportWithCount(cmd, 1, &viewport);
+
+	VkRect2D scissor{
+		{0, 0},
+		swapchain.extent,
+	};
+	vkCmdSetScissorWithCount(cmd, 1, &scissor);
+
+	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.graphics);
+	vkCmdDraw(cmd, 3, 1, 0, 0);
+	vkCmdEndRendering(cmd);
+
+	barrier.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+	barrier.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+	barrier.dstStageMask = VK_PIPELINE_STAGE_2_NONE;
+	barrier.dstAccessMask = 0;
+	barrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+	vkCmdPipelineBarrier2(cmd, &dep);
+
+	vkEndCommandBuffer(cmd);
+}
+
+void App::draw_frame() {
+	vkWaitForFences(device, 1, &frames[current_frame].in_flight, VK_TRUE, UINT64_MAX);
+
+	u32 image_index;
+	VkAcquireNextImageInfoKHR acquire_info{
+		.sType = VK_STRUCTURE_TYPE_ACQUIRE_NEXT_IMAGE_INFO_KHR,
+		.swapchain = swapchain.swapchain,
+		.timeout = UINT64_MAX,
+		.semaphore = frames[current_frame].img_available,
+		.fence = VK_NULL_HANDLE,
+		.deviceMask = 1,
+	};
+	vkAcquireNextImage2KHR(device, &acquire_info, &image_index);
+
+	if (swapchain.in_flight[image_index] != VK_NULL_HANDLE) {
+		vkWaitForFences(device, 1, &swapchain.in_flight[image_index], VK_TRUE, UINT64_MAX);
+	}
+	swapchain.in_flight[image_index] = frames[current_frame].in_flight;
+
+	vkResetFences(device, 1, &frames[current_frame].in_flight);
+	vkResetCommandPool(device, frames[current_frame].graphics_pool, 0);
+	record_draw_buffer(frames[current_frame].graphics_cmd, image_index);
+
+	VkSemaphoreSubmitInfo wait_sem_info{
+		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+		.semaphore = frames[current_frame].img_available,
+		.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+	};
+
+	VkCommandBufferSubmitInfo cmd_submit_info{
+		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+		.commandBuffer = frames[current_frame].graphics_cmd,
+	};
+
+	VkSemaphoreSubmitInfo signal_sem_info{
+		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+		.semaphore = swapchain.render_finished[image_index],
+		.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+	};
+
+	VkSubmitInfo2 submit_info{
+		.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+		.waitSemaphoreInfoCount = 1,
+		.pWaitSemaphoreInfos = &wait_sem_info,
+		.commandBufferInfoCount = 1,
+		.pCommandBufferInfos = &cmd_submit_info,
+		.signalSemaphoreInfoCount = 1,
+		.pSignalSemaphoreInfos = &signal_sem_info,
+	};
+	vkQueueSubmit2(queues.graphics, 1, &submit_info, frames[current_frame].in_flight);
+
+	VkPresentInfoKHR present_info{
+		.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+		.waitSemaphoreCount = 1,
+		.pWaitSemaphores = &swapchain.render_finished[image_index],
+		.swapchainCount = 1,
+		.pSwapchains = &swapchain.swapchain,
+		.pImageIndices = &image_index,
+	};
+	vkQueuePresentKHR(queues.present, &present_info);
+
+	current_frame = (current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
 }
