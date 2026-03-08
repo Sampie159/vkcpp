@@ -13,9 +13,9 @@ set(FETCHCONTENT_QUIET FALSE)
 
 set(FLAGS "-Wall")
 
-if (CMAKE_BUILD_TYPE STREQUAL "Release")
-    set (FLAGS "${FLAGS} -Werror")
-endif ()
+# if (CMAKE_BUILD_TYPE STREQUAL "Release")
+#     set (FLAGS "${FLAGS} -Werror")
+# endif ()
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${FLAGS}")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CMAKE_C_FLAGS}")

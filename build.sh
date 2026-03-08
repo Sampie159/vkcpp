@@ -6,7 +6,7 @@ RUN=false
 
 OPTSTR=":rRcs"
 
-SHADERS=(tri.vert tri.frag)
+SHADERS=(tri.slang)
 
 while getopts "${OPTSTR}" opt; do
     case ${opt} in
@@ -24,7 +24,8 @@ while getopts "${OPTSTR}" opt; do
             echo "Compiling shaders!"
             for shader in "${SHADERS[@]}"; do
                 echo "Compiling $shader"
-                glslc -O --target-env=vulkan1.4 shaders/$shader -o shaders/${shader}.spv
+                slangc shaders/tri.slang -target spirv -profile spirv_1_6 -emit-spirv-directly -O2 \
+                       -fvk-use-entrypoint-name -o shaders/tri.spv
 
                 if [[ $? = 0 ]]; then
                     echo "$shader compiled successfully"
