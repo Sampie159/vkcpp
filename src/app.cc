@@ -23,12 +23,14 @@ struct App {
 	void create_swapchain();
 	void create_sync_objects();
 	void create_command_buffers();
+	void create_descriptor_sets();
 	void create_graphics_pipeline();
 
 	void run();
 	VkShaderModule create_shader_module(const char* path);
 	void record_draw_buffer(VkCommandBuffer cmd, u32 image_index);
 	void draw_frame();
+	void recreate_swapchain();
 
 	GLFWwindow* window;
 	VkInstance instance;
@@ -40,6 +42,7 @@ struct App {
 
     struct {
 		VkSwapchainKHR swapchain;
+		VkSwapchainCreateInfoKHR create_info;
 		VkImage* images;
 		VkImageView* image_views;
 		u32 image_count;
@@ -80,10 +83,12 @@ struct App {
 	struct {
 		VkPipelineLayout graphics_layout;
 		VkPipeline graphics;
+		VkDescriptorSetLayout set_layout;
 	} pipeline;
 
 	Arena arena{GB(1)};
 	u32 current_frame = 0;
+	bool framebuffer_resized = false;
 };
 
 static void error_callback(s32 code, const char* desc) {
@@ -94,6 +99,11 @@ static void key_callback(GLFWwindow* window, s32 key, s32 scancode, s32 action, 
 	if (action == GLFW_PRESS) {
 		if (key == GLFW_KEY_Q || key == GLFW_KEY_ESCAPE) glfwSetWindowShouldClose(window, GLFW_TRUE);
 	}
+}
+
+static void resize_callback(GLFWwindow* window, s32 width, s32 height) {
+	auto app = (App*)glfwGetWindowUserPointer(window);
+	app->framebuffer_resized = true;
 }
 
 #if DEBUG
@@ -131,6 +141,7 @@ App::App() {
 	create_swapchain();
 	create_sync_objects();
 	create_command_buffers();
+	create_descriptor_sets();
 	create_graphics_pipeline();
 }
 
@@ -141,7 +152,6 @@ void App::init_glfw() {
 	}
 
 	glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-	glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
 
 	window = glfwCreateWindow(WIDTH, HEIGHT, TITLE, NULL, NULL);
 	if (!window) {
@@ -149,6 +159,8 @@ void App::init_glfw() {
 		Panic("Failed to create window!");
 	}
 	glfwSetKeyCallback(window, key_callback);
+	glfwSetWindowUserPointer(window, this);
+	glfwSetFramebufferSizeCallback(window, resize_callback);
 }
 
 void App::create_instance() {
@@ -434,7 +446,7 @@ void App::create_swapchain() {
 		image_count = MIN(image_count, surface_capabilities.surfaceCapabilities.maxImageCount);
 	}
 
-	VkSwapchainCreateInfoKHR create_info{
+	swapchain.create_info = {
 		.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
 		.surface = surface_info.surface,
 		.minImageCount = image_count,
@@ -452,14 +464,14 @@ void App::create_swapchain() {
 
 	u32 queue_indices[] = { families.graphics, families.present };
 	if (families.graphics != families.present) {
-		create_info.imageSharingMode = VK_SHARING_MODE_CONCURRENT;
-		create_info.queueFamilyIndexCount = 2;
-		create_info.pQueueFamilyIndices = queue_indices;
+		swapchain.create_info.imageSharingMode = VK_SHARING_MODE_CONCURRENT;
+		swapchain.create_info.queueFamilyIndexCount = 2;
+		swapchain.create_info.pQueueFamilyIndices = queue_indices;
 	} else {
-		create_info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+		swapchain.create_info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
 	}
 
-	if (vkCreateSwapchainKHR(device, &create_info, NULL, &swapchain.swapchain) != VK_SUCCESS) {
+	if (vkCreateSwapchainKHR(device, &swapchain.create_info, NULL, &swapchain.swapchain) != VK_SUCCESS) {
 		Panic("Failed to create swapchain!");
 	}
 
@@ -579,9 +591,30 @@ void App::create_command_buffers() {
 	}
 }
 
+void App::create_descriptor_sets() {
+	VkDescriptorSetLayoutBinding layout_binding{
+		.binding = 0,
+		.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+		.descriptorCount = 1,
+		.stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+	};
+
+	VkDescriptorSetLayoutCreateInfo layout_info{
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+		.bindingCount = 1,
+		.pBindings = &layout_binding,
+	};
+
+	if (vkCreateDescriptorSetLayout(device, &layout_info, NULL, &pipeline.set_layout) != VK_SUCCESS) {
+		Panic("Failed to create descriptor set layout!");
+	}
+}
+
 void App::create_graphics_pipeline() {
 	VkPipelineLayoutCreateInfo graphics_layout = {
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+		.setLayoutCount = 1,
+		.pSetLayouts = &pipeline.set_layout,
 	};
 
 	if (vkCreatePipelineLayout(device, &graphics_layout, NULL, &pipeline.graphics_layout) != VK_SUCCESS) {
@@ -699,6 +732,8 @@ App::~App() {
 	vkDestroyPipeline(device, pipeline.graphics, NULL);
 	vkDestroyPipelineLayout(device, pipeline.graphics_layout, NULL);
 
+	vkDestroyDescriptorSetLayout(device, pipeline.set_layout, NULL);
+
 	for (u32 i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
 		vkDestroySemaphore(device, frames[i].img_available, NULL);
 		vkDestroyFence(device, frames[i].in_flight, NULL);
@@ -728,7 +763,6 @@ void App::run() {
 	arena.reset();
 
 	while (!glfwWindowShouldClose(window)) {
-		Log("Loop!");
 		glfwPollEvents();
 		draw_frame();
 		arena.reset();
@@ -845,7 +879,13 @@ void App::draw_frame() {
 		.fence = VK_NULL_HANDLE,
 		.deviceMask = 1,
 	};
-	vkAcquireNextImage2KHR(device, &acquire_info, &image_index);
+	VkResult res = vkAcquireNextImage2KHR(device, &acquire_info, &image_index);
+	if (res == VK_ERROR_OUT_OF_DATE_KHR) {
+		recreate_swapchain();
+		return;
+	} else if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR) {
+		Panic("Failed to acquire swapchain image!");
+	}
 
 	if (swapchain.in_flight[image_index] != VK_NULL_HANDLE) {
 		vkWaitForFences(device, 1, &swapchain.in_flight[image_index], VK_TRUE, UINT64_MAX);
@@ -892,7 +932,81 @@ void App::draw_frame() {
 		.pSwapchains = &swapchain.swapchain,
 		.pImageIndices = &image_index,
 	};
-	vkQueuePresentKHR(queues.present, &present_info);
+	res = vkQueuePresentKHR(queues.present, &present_info);
+	if (res == VK_ERROR_OUT_OF_DATE_KHR || res == VK_SUBOPTIMAL_KHR || framebuffer_resized) {
+		recreate_swapchain();
+	} else if (res != VK_SUCCESS) {
+		Panic("Failed to present swapchain image!");
+	}
 
 	current_frame = (current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
+}
+
+void App::recreate_swapchain() {
+	framebuffer_resized = false;
+
+	if (vkGetPhysicalDeviceSurfaceCapabilities2KHR(physical_device, &surface_info, &surface_capabilities) != VK_SUCCESS) {
+		Panic("Failed to get surface capabilities!");
+	}
+
+	if (surface_capabilities.surfaceCapabilities.currentExtent.width != UINT32_MAX) {
+		swapchain.extent = surface_capabilities.surfaceCapabilities.currentExtent;
+	} else {
+		glfwGetFramebufferSize(window, (s32*)&swapchain.extent.width, (s32*)&swapchain.extent.height);
+	}
+
+	while (swapchain.extent.width == 0 || swapchain.extent.height == 0) {
+		glfwGetFramebufferSize(window, (s32*)&swapchain.extent.width, (s32*)&swapchain.extent.height);
+		glfwWaitEvents();
+	}
+
+	vkDeviceWaitIdle(device);
+	swapchain.create_info.oldSwapchain = swapchain.swapchain;
+	swapchain.create_info.imageExtent = swapchain.extent;
+
+	if (vkCreateSwapchainKHR(device, &swapchain.create_info, NULL, &swapchain.swapchain) != VK_SUCCESS) {
+		Panic("Failed to create swapchain!");
+	}
+
+	for (u32 i = 0; i < swapchain.image_count; i++) {
+		vkDestroyImageView(device, swapchain.image_views[i], NULL);
+		vkDestroySemaphore(device, swapchain.render_finished[i], NULL);
+	}
+
+	vkGetSwapchainImagesKHR(device, swapchain.swapchain, &swapchain.image_count, NULL);
+	swapchain.images = (VkImage*)realloc(swapchain.images, sizeof(VkImage) * swapchain.image_count);
+	swapchain.image_views = (VkImageView*)realloc(swapchain.image_views, sizeof(VkImageView) * swapchain.image_count);
+	vkGetSwapchainImagesKHR(device, swapchain.swapchain, &swapchain.image_count, swapchain.images);
+
+	swapchain.render_finished = (VkSemaphore*)realloc(swapchain.render_finished, sizeof(VkSemaphore) * swapchain.image_count);
+	swapchain.in_flight = (VkFence*)realloc(swapchain.in_flight, sizeof(VkFence) * swapchain.image_count);
+
+	VkSemaphoreCreateInfo sem_info{
+		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+	};
+
+	for (u32 i = 0; i < swapchain.image_count; i++) {
+		VkImageViewCreateInfo img_info{
+			.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+			.image = swapchain.images[i],
+			.viewType = VK_IMAGE_VIEW_TYPE_2D,
+			.format = swapchain.format,
+			.subresourceRange = {
+				.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+				.levelCount = 1,
+				.layerCount = 1,
+			},
+		};
+		if (vkCreateImageView(device, &img_info, NULL, &swapchain.image_views[i]) != VK_SUCCESS) {
+			Panic("Failed to create image view %u!", i);
+		}
+
+		if (vkCreateSemaphore(device, &sem_info, NULL, &swapchain.render_finished[i]) != VK_SUCCESS) {
+			Panic("Failed to create render finished semaphore %u!", i);
+		}
+
+		swapchain.in_flight[i] = VK_NULL_HANDLE;
+	}
+
+	vkDestroySwapchainKHR(device, swapchain.create_info.oldSwapchain, NULL);
 }
